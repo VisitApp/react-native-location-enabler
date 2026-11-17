@@ -89,9 +89,10 @@ export function useLocationSettingsStatus() {
 | `useLocationSettings(config, initialStatus?)` | Checks the settings and returns `[locationEnabled, requestResolution]`. Omit `initialStatus` to start with `undefined` while the check is pending. |
 | `checkSettings(config)` | Checks whether the device meets the requested settings and reports the result asynchronously through the listener. |
 | `requestResolutionSettings(config)` | Asks Android to show a resolution dialog when the requested settings are unmet and the issue can be resolved by the user. |
+| `ensureLocationSettings(config)` | Checks settings and awaits the result of any resolution dialog. Returns `true` if the settings are satisfied or `false` if the user cancels or the settings cannot be enabled. Call it after obtaining app location permission. |
 | `addListener(callback, context?)` | Subscribes to location settings results. The callback receives `{ locationEnabled: boolean }`. Call `.remove()` on the returned subscription during cleanup. |
 
-All configuration fields are optional. The native module starts with the values below and reuses the current value for any field omitted from a subsequent call.
+All configuration fields are optional. `ensureLocationSettings` uses the defaults below for omitted fields on each call. The listener and hook APIs retain their most recently supplied settings for omitted fields.
 
 | Option | Initial value | Purpose |
 | --- | --- | --- |

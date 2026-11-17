@@ -89,6 +89,9 @@ export interface LocationEnablerType {
    */
   requestResolutionSettings(config: Config): void;
 
+  /** Checks device location settings and awaits the result of any resolution dialog. */
+  ensureLocationSettings(config: Config): Promise<boolean>;
+
   /**
    * Adds a listener to be invoked when onChangeLocationSettings are emitted.
    * An optional calling context may be provided. The data arguments emitted
