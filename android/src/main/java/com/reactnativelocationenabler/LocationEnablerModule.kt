@@ -11,36 +11,60 @@ import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationRequest.*
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.LocationSettingsRequest
-import com.google.android.gms.location.LocationSettingsResponse
-import com.google.android.gms.tasks.Task
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import java.util.*
 
 class LocationEnablerModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
 
-  init {
-    val activityEventListener = object : BaseActivityEventListener() {
-      override fun onActivityResult(activity: Activity, requestCode: Int, resultCode: Int, @Nullable intent: Intent?) {
-        if (intent !== null && requestCode != REQUEST_TURN_DEVICE_LOCATION_ON) return
-        val result = Arguments.createMap()
-        when (resultCode) {
-          -1 -> result.putBoolean("locationEnabled", true)
-          else -> result.putBoolean("locationEnabled", false)
-        }
-        sendEvent(EVENT_NAME, result)
-      }
-    }
-    reactContext.addActivityEventListener(activityEventListener)
-  }
-
   private val TAG = "LocationEnabler"
   private val REQUEST_TURN_DEVICE_LOCATION_ON = 29
+  private val REQUEST_ENSURE_LOCATION_SETTINGS = 0x564C
   private val EVENT_NAME = "onChangeLocationSettings"
   private val context: ReactApplicationContext = reactContext
   private var priority: Int = PRIORITY_BALANCED_POWER_ACCURACY
   private var alwaysShow: Boolean = false
   private var needBle: Boolean = false
+
+  private data class LocationSettingsCheck(
+    val request: LocationSettingsRequest,
+    val promise: Promise,
+  )
+
+  // Accessed on the main thread by the settings task and the activity result.
+  private var pendingSettingsCheck: LocationSettingsCheck? = null
+
+  private val activityEventListener = object : BaseActivityEventListener() {
+    override fun onActivityResult(activity: Activity, requestCode: Int, resultCode: Int, @Nullable intent: Intent?) {
+      when (requestCode) {
+        REQUEST_ENSURE_LOCATION_SETTINGS -> {
+          val check = pendingSettingsCheck ?: return
+          if (resultCode == Activity.RESULT_OK) {
+            checkSettings(activity, check, allowResolution = false)
+          } else {
+            finishSettingsCheck(check, false)
+          }
+        }
+        REQUEST_TURN_DEVICE_LOCATION_ON -> {
+          val result = Arguments.createMap()
+          result.putBoolean("locationEnabled", resultCode == Activity.RESULT_OK)
+          sendEvent(EVENT_NAME, result)
+        }
+      }
+    }
+  }
+
+  init {
+    reactContext.addActivityEventListener(activityEventListener)
+  }
+
+  override fun invalidate() {
+    context.removeActivityEventListener(activityEventListener)
+    UiThreadUtil.runOnUiThread {
+      pendingSettingsCheck?.let { finishSettingsCheck(it, false) }
+    }
+    super.invalidate()
+  }
 
   override fun getName(): String = TAG
 
@@ -65,24 +89,76 @@ class LocationEnablerModule(reactContext: ReactApplicationContext) : ReactContex
     requestDeviceResolutionLocationSettings(priority, alwaysShow, needBle)
   }
 
+  @ReactMethod
+  fun ensureLocationSettings(config: ReadableMap, promise: Promise) {
+    UiThreadUtil.runOnUiThread {
+      val activity = context.currentActivity
+      if (activity == null || activity.isFinishing || activity.isDestroyed || pendingSettingsCheck != null) {
+        promise.resolve(false)
+        return@runOnUiThread
+      }
+
+      val request = createLocationSettingsRequest(
+        if (config.hasKey("priority")) config.getInt("priority") else PRIORITY_BALANCED_POWER_ACCURACY,
+        config.hasKey("alwaysShow") && config.getBoolean("alwaysShow"),
+        config.hasKey("needBle") && config.getBoolean("needBle"),
+      )
+      val check = LocationSettingsCheck(request, promise)
+      pendingSettingsCheck = check
+      checkSettings(activity, check, allowResolution = true)
+    }
+  }
+
+  private fun checkSettings(activity: Activity, check: LocationSettingsCheck, allowResolution: Boolean) {
+    try {
+      LocationServices.getSettingsClient(activity).checkLocationSettings(check.request)
+        .addOnCompleteListener { task ->
+          if (pendingSettingsCheck !== check) return@addOnCompleteListener
+          val exception = task.exception
+          when {
+            task.isSuccessful -> finishSettingsCheck(check, true)
+            allowResolution && exception is ResolvableApiException &&
+              context.currentActivity === activity && !activity.isFinishing && !activity.isDestroyed -> {
+              try {
+                exception.startResolutionForResult(activity, REQUEST_ENSURE_LOCATION_SETTINGS)
+              } catch (error: IntentSender.SendIntentException) {
+                finishSettingsCheck(check, false)
+              } catch (error: RuntimeException) {
+                finishSettingsCheck(check, false)
+              }
+            }
+            else -> finishSettingsCheck(check, false)
+          }
+        }
+    } catch (error: RuntimeException) {
+      finishSettingsCheck(check, false)
+    }
+  }
+
+  private fun finishSettingsCheck(check: LocationSettingsCheck, enabled: Boolean) {
+    if (pendingSettingsCheck !== check) return
+    pendingSettingsCheck = null
+    check.promise.resolve(enabled)
+  }
+
   private fun extractArgs(config: ReadableMap) = runBlocking(Dispatchers.Default) {
     if (config.hasKey("priority")) priority = config.getInt("priority")
     if (config.hasKey("alwaysShow")) alwaysShow = config.getBoolean("alwaysShow")
     if (config.hasKey("needBle")) needBle = config.getBoolean("needBle")
   }
 
-  private fun locationSettingsRequestBuilder(priority: Int, alwaysShow: Boolean, needBle: Boolean): Task<LocationSettingsResponse> {
+  private fun createLocationSettingsRequest(priority: Int, alwaysShow: Boolean, needBle: Boolean): LocationSettingsRequest {
     val locationRequest = LocationRequest.create().setPriority(priority)
-    val build = LocationSettingsRequest.Builder()
+    return LocationSettingsRequest.Builder()
       .setAlwaysShow(alwaysShow)
       .setNeedBle(needBle)
       .addLocationRequest(locationRequest).build()
-    return LocationServices.getSettingsClient(context.currentActivity!!).checkLocationSettings(build)
   }
 
   private fun checkDeviceLocationSettings(priority: Int, alwaysShow: Boolean, needBle: Boolean) = runBlocking(Dispatchers.Default) {
-    if (context.currentActivity != null) {
-      val locationSettingsResponseTask = locationSettingsRequestBuilder(priority, alwaysShow, needBle)
+    context.currentActivity?.let { activity ->
+      val request = createLocationSettingsRequest(priority, alwaysShow, needBle)
+      val locationSettingsResponseTask = LocationServices.getSettingsClient(activity).checkLocationSettings(request)
       val res = Arguments.createMap()
       locationSettingsResponseTask.addOnFailureListener {
         res.putBoolean("locationEnabled", false)
@@ -96,11 +172,12 @@ class LocationEnablerModule(reactContext: ReactApplicationContext) : ReactContex
   }
 
   private fun requestDeviceResolutionLocationSettings(priority: Int, alwaysShow: Boolean, needBle: Boolean) = runBlocking(Dispatchers.Default) {
-    if (context.currentActivity != null) {
-      val locationSettingsResponseTask = locationSettingsRequestBuilder(priority, alwaysShow, needBle)
+    context.currentActivity?.let { activity ->
+      val request = createLocationSettingsRequest(priority, alwaysShow, needBle)
+      val locationSettingsResponseTask = LocationServices.getSettingsClient(activity).checkLocationSettings(request)
       locationSettingsResponseTask.addOnFailureListener { exception ->
         if (exception is ResolvableApiException) try {
-          exception.startResolutionForResult(context.currentActivity!!, REQUEST_TURN_DEVICE_LOCATION_ON)
+          exception.startResolutionForResult(activity, REQUEST_TURN_DEVICE_LOCATION_ON)
         } catch (sendEx: IntentSender.SendIntentException) {
           println("requestDeviceResolutionLocationSettings.addOnFailureListener > catch error > " + sendEx.localizedMessage)
         }
